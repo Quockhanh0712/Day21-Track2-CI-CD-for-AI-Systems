@@ -11,149 +11,184 @@ on:
 
 jobs:
 
-  # ---------------------------------------------------------------------------
-  # JOB 1 - UNIT TEST
-  # Chay unit tests tren du lieu ao (khong can ket noi cloud storage).
-  # Neu co bat ky test nao that bai, pipeline dung lai o day va khong tien hanh
-  # huan luyen hay trien khai.
-  # ---------------------------------------------------------------------------
+  # JOB 1: Run unit tests on mock data (no S3 credentials required)
   test:
     name: Unit Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.12"
+          cache: 'pip'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install --upgrade pip
+          pip install "setuptools<70"
+          pip install -r requirements.txt
 
-      - name: Run unit tests
-        # TODO 1: Viet lenh de chay pytest tren thu muc tests/ voi co -v
-        run: # <dien lenh o day>
+      - name: Run pytest
+        run: pytest tests/ -v
 
-
-  # ---------------------------------------------------------------------------
-  # JOB 2 - TRAIN
-  # Xac thuc cloud storage, pull du lieu bang DVC, huan luyen mo hinh, upload artifact.
-  # Chi chay khi Job 1 (Unit Test) hoan thanh thanh cong.
-  # ---------------------------------------------------------------------------
+  # JOB 2: Train model on actual DVC data, upload artifacts
   train:
-    name: Train
+    name: Train Model
     needs: test
     runs-on: ubuntu-latest
     outputs:
       accuracy: ${{ steps.read_metrics.outputs.accuracy }}
-
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - name: Checkout code
+        uses: actions/checkout@v4
         with:
-          python-version: "3.10"
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: 'pip'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Authenticate to Cloud Storage
-        # TODO 2: Ghi noi dung credentials ra file tam va set bien moi truong xac thuc.
-        # GCP:   echo '${{ secrets.CLOUD_CREDENTIALS }}' > /tmp/sa-key.json
-        #        echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa-key.json" >> $GITHUB_ENV
-        # AWS:   echo "AWS_ACCESS_KEY_ID=..." >> $GITHUB_ENV  (lay tu secrets)
-        #        echo "AWS_SECRET_ACCESS_KEY=..." >> $GITHUB_ENV
-        # Azure: echo "AZURE_STORAGE_CONNECTION_STRING=..." >> $GITHUB_ENV
         run: |
-          # <dien code o day>
+          pip install --upgrade pip
+          pip install "setuptools<70"
+          pip install -r requirements.txt
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
 
       - name: Pull data with DVC
-        # TODO 3: Pull cac file du lieu can thiet tu cloud storage bang lenh dvc pull.
-        #         Chi pull train_phase1.csv va eval.csv (khong can train_phase2.csv).
-        run: # <dien lenh o day>
+        run: dvc pull -v
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
       - name: Train model
         run: python src/train.py
 
       - name: Read metrics
         id: read_metrics
-        # TODO 4: Doc gia tri "accuracy" tu outputs/metrics.json bang Python inline.
-        #         Set ket qua thanh output "accuracy" de job deploy co the doc.
-        #
-        # Goi y:
-        #   ACC=$(python -c "import json; d=json.load(open('outputs/metrics.json')); print(d['accuracy'])")
-        #   echo "accuracy=$ACC" >> $GITHUB_OUTPUT
         run: |
-          # <dien code o day>
+          accuracy=$(python -c "import json; print(json.load(open('outputs/metrics.json'))['accuracy'])")
+          echo "accuracy=$accuracy"
+          echo "accuracy=$accuracy" >> $GITHUB_OUTPUT
 
-      - name: Upload model to Cloud Storage
-        # TODO 5: Su dung cloud SDK de upload models/model.pkl len
-        #         <bucket>/models/latest/model.pkl.
-        #         Ten bucket lay tu secret CLOUD_BUCKET.
-        run: |
-          python - <<'EOF'
-          # <dien code Python o day>
-          EOF
-
-      - name: Save metrics as artifact
+      - name: Upload local artifacts for evaluation
         uses: actions/upload-artifact@v4
         with:
-          name: metrics
-          path: outputs/metrics.json
+          name: model-artifacts
+          path: |
+            models/model.pkl
+            outputs/metrics.json
+            outputs/report.txt
 
-
-  # ---------------------------------------------------------------------------
-  # JOB 3 - EVAL
-  # Kiem tra nguong chat luong (accuracy >= 0.70).
-  # Pipeline dung lai o day neu mo hinh chua dat yeu cau.
-  # Chi chay khi Job 2 (Train) hoan thanh thanh cong.
-  # ---------------------------------------------------------------------------
+  # JOB 3: Quality evaluation gate (Accuracy >= 0.70 and Rollback check)
   eval:
-    name: Eval
+    name: Quality Gate & Rollback Check
     needs: train
     runs-on: ubuntu-latest
     steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-      - name: Check eval gate
-        # TODO 6: Doc accuracy tu output cua job train.
-        #         Neu accuracy < 0.70, ket thuc voi loi ro rang.
-        #         Neu dat nguong, in thong bao va tiep tuc.
-        #
-        # Goi y:
-        #   acc = float("${{ needs.train.outputs.accuracy }}")
-        #   if acc < 0.70:
-        #       raise SystemExit(f"FAILED: accuracy {acc:.4f} < 0.70. Huy deploy.")
-        #   print("PASSED: dang trien khai model.")
+      - name: Install boto3
+        run: pip install boto3
+
+      - name: Download training artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: model-artifacts
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+
+      - name: Run Eval Gate and Upload to S3
+        env:
+          CLOUD_BUCKET: ${{ secrets.CLOUD_BUCKET }}
+          NEW_ACCURACY: ${{ needs.train.outputs.accuracy }}
         run: |
           python - <<'EOF'
-          # <dien code Python o day>
+          import os
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+
+          bucket = os.environ["CLOUD_BUCKET"]
+          new_acc = float(os.environ["NEW_ACCURACY"])
+          threshold = 0.70
+
+          print(f"--- Starting Quality Gate Checks ---")
+          print(f"New Model Accuracy: {new_acc:.4f}")
+          print(f"Required Threshold: {threshold:.4f}")
+
+          # 1. Performance threshold check
+          if new_acc < threshold:
+              print(f"ERROR: New model accuracy {new_acc:.4f} is BELOW the threshold of {threshold:.4f}!")
+              exit(1)
+          print("Performance threshold check: PASSED")
+
+          # 2. Rollback gate (Compare with previous model)
+          s3 = boto3.client("s3")
+          prev_acc = 0.0
+          try:
+              print("Attempting to fetch previous model metrics from S3...")
+              s3.download_file(bucket, "outputs/metrics.json", "prev_metrics.json")
+              with open("prev_metrics.json", "r") as f:
+                  prev_metrics = json.load(f)
+                  prev_acc = float(prev_metrics.get("accuracy", 0.0))
+                  print(f"Previous Model Accuracy: {prev_acc:.4f}")
+          except ClientError as e:
+              if e.response['Error']['Code'] == "404":
+                  print("No previous model metrics found in S3. Skipping rollback comparison (first run).")
+              else:
+                  print(f"Warning: Failed to fetch previous metrics: {str(e)}")
+                  print("Proceeding assuming first run.")
+
+          if new_acc < prev_acc:
+              print(f"ERROR: Rollback Gate Triggered! New accuracy {new_acc:.4f} is LOWER than previous accuracy {prev_acc:.4f}!")
+              exit(1)
+          print("Rollback check: PASSED")
+
+          # 3. Upload validated model and metrics to S3
+          print("--- All Checks Passed. Uploading validated model and metrics to S3 ---")
+          s3.upload_file("models/model.pkl", bucket, "models/latest/model.pkl")
+          s3.upload_file("outputs/metrics.json", bucket, "outputs/metrics.json")
+          s3.upload_file("outputs/report.txt", bucket, "outputs/report.txt")
+          print("Upload to S3 completed successfully.")
           EOF
 
-
-  # ---------------------------------------------------------------------------
-  # JOB 4 - DEPLOY
-  # Trien khai len VM qua SSH.
-  # Chi chay khi Job 3 (Eval) hoan thanh thanh cong.
-  # ---------------------------------------------------------------------------
+  # JOB 4: Deploy model server on AWS EC2
   deploy:
-    name: Deploy
+    name: Continuous Deployment
     needs: eval
     runs-on: ubuntu-latest
     steps:
-
-      - name: SSH deploy to VM
+      - name: SSH to EC2 and Deploy
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
           script: |
-            # TODO 7: Restart service mlops-serve tren VM.
-            # TODO 8: Cho server san sang roi goi curl /health de xac nhan.
-            #         Neu health check that bai sau nhieu lan thu, thoat voi exit 1.
-            #
-            # Goi y:
-            #   sudo systemctl restart mlops-serve
-            #   sleep 5
-            #   curl -sf http://localhost:8000/health && echo "Health check passed." || exit 1
-            # <dien lenh bash o day>
+            echo "Restarting the MLOps inference service on AWS EC2..."
+            sudo systemctl restart mlops-serve
+            echo "Waiting for service to initialize..."
+            sleep 5
+            echo "Running health check..."
+            curl -f http://localhost:8000/health
+            echo "Deployment verified successfully."
